@@ -7,6 +7,7 @@
 const express = require ('express'); // manejar las solicitudes http
 const cors = require ('cors');
 const dotenv = require ('dotenv');
+
 const routes = require ('../rutas/routes');
 
 dotenv.config();
@@ -21,10 +22,8 @@ riz.use(express.json()); // parser del json
 riz.use('/', routes);
 // Ruta de prueba
 riz.get('/health', (req, res) => {
-  res.json({ message: 'Backend ZKP funcionando correctamente' });
+  res.json({ message: 'starting project RUN' });
 }); 
-
-
 
 // trabaja con el .env archivo de configuracion
 // levanta el servidor
