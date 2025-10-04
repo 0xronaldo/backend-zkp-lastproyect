@@ -119,23 +119,23 @@ const createUserAuthCredential = (did, userData) => {
     return {
         "@context": [
             "https://www.w3.org/2018/credentials/v2",
-            "https://schema.iden3.io/core/jsonld/iden3proofs.jsonld",
-            "ipfs://QmUserAuthCredentialContext"
+            // "https://schema.iden3.io/core/jsonld/iden3proofs.jsonld",
+            "ipfs://QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp"
         ],
-        "type": ["VerifiableCredential", "UserAuthCredential"],
+        "type": ["VerifiableCredential", "ZKPAuthCredential"],
         "credentialSubject": {
             id: did,
-            fullName: userData.name,
+            fullName: userData.fullName || userData.name,
             email: userData.email || null,
             walletAddress: userData.walletAddress || null,
             authMethod: userData.authMethod || 'email',
-            accountState: userData.state || 'active',
+            accountState: userData.accountState || userData.state || 'active',
             registrationDate: currentTimestamp,
             isVerified: userData.isVerified || false
         },
         "credentialSchema": {
-            "id": "ipfs://QmUserAuthCredentialSchema",
-            "type": "JsonSchemaValidator2018"
+            "id": "https://gateway.pinata.cloud/ipfs/QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
+            "type": "JsonSchema2023"
         },
         "issuanceDate": new Date().toISOString(),
         "expirationDate": new Date(expirationTimestamp * 1000).toISOString()
@@ -150,23 +150,24 @@ const createWalletAuthCredential = (did, walletAddress, userData = {}) => {
 
     return {
         "@context": [
-            "https://www.w3.org/2018/credentials/v1",
+            "https://www.w3.org/2018/credentials/v2",
             "https://schema.iden3.io/core/jsonld/iden3proofs.jsonld",
-            "ipfs://QmWalletAuthContext"
+            "ipfs://QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp"
         ],
-        "type": ["VerifiableCredential", "WalletAuthCredential"],
+        "type": ["VerifiableCredential", "ZKPAuthCredential"],
         "credentialSubject": {
             id: did,
+            fullName: userData.fullName || userData.name || `Wallet ${walletAddress.slice(0, 6)}...`,
+            email: null,
             walletAddress: walletAddress,
-            fullName: userData.name || `Wallet ${walletAddress.slice(0, 6)}...`,
             authMethod: 'wallet',
-            accountState: 'active',
+            accountState: userData.accountState || 'active',
             registrationDate: currentTimestamp,
-            isVerified: true // Wallet connections son verificadas por firma
+            isVerified: true
         },
         "credentialSchema": {
-            "id": "ipfs://QmWalletAuthSchema",
-            "type": "JsonSchemaValidator2018"
+            "id": "https://gateway.pinata.cloud/ipfs/QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
+            "type": "JsonSchema2023"
         },
         "issuanceDate": new Date().toISOString()
     };
