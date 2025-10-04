@@ -1,6 +1,18 @@
 const crypto = require('crypto');
 
 // ============================================
+// POR QUÉ CRYPTO Y NO ETHERS
+// ============================================
+// crypto: Nativo de Node.js, para hashing y operaciones básicas
+// ethers: Para blockchain (firmas, transacciones, smart contracts)
+// 
+// En este backend:
+// - Solo hasheamos datos con crypto
+// - El Issuer Node hace las firmas ZKP
+// - No interactuamos directamente con blockchain
+// - No firmamos transacciones
+
+// ============================================
 // UTILIDADES PARA GENERACIÓN DE DIDs
 // ============================================
 

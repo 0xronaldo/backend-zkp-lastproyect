@@ -1,102 +1,252 @@
 const express = require('express');
 const axios = require('axios');
 const dotenv = require('dotenv');
-dat_config = dotenv.config();
+dotenv.config();
+
 const { 
     userToIdentitySchema, 
     walletToIdentitySchema,
     createUserAuthCredential,
     createWalletAuthCredential,
-    createVerifiableCredentialSchema, 
-    formatResponseForFrontend,
-    formatLoginResponse,
     didFromEthAddress
 } = require('../scheme/scheme');
 
+const { validateUserData, createCredentialRequest } = require('../src/datasure');
+const { validateDID, validateEmail, hashData } = require('../src/validador');
 
 const router = express.Router();
 
-// Configura la URL base ISSUER
-const ISSUER_NODE_BASE_URL = process.env.ISSUER_NODE_BASE_URL; // Cambia el puerto/host según tu configuración
+const ISSUER_NODE_URL = process.env.ISSUER_NODE_BASE_URL || 'http://localhost:3001';
+const ISSUER_NODE_USER = process.env.ISSUER_NODE_USER || 'user-issuer';
+const ISSUER_NODE_PASSWORD = process.env.ISSUER_NODE_PASSWORD || 'password-issuer';
 
-/**
- * End points
- */
+// Configuración para axios con Basic Auth
+const issuerAuth = {
+    username: ISSUER_NODE_USER,
+    password: ISSUER_NODE_PASSWORD
+};
+
+const issuerHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+};
+
+console.log('[Config] Issuer Node URL:', ISSUER_NODE_URL);
+console.log('[Config] Issuer Auth: ✅ Enabled');
+
+// ============================================
+// HELPER: Obtener DID del Issuer
+// ============================================
+let ISSUER_DID = null;
+
+async function getIssuerDID() {
+    if (ISSUER_DID) return ISSUER_DID;
+    
+    try {
+        const response = await axios.get(
+            `${ISSUER_NODE_URL}/v2/identities`,
+            { 
+                headers: issuerHeaders,
+                auth: issuerAuth
+            }
+        );
+        
+        if (response.data && response.data.length > 0) {
+            ISSUER_DID = response.data[0].identifier;
+            console.log('[Config] Issuer DID obtenido:', ISSUER_DID);
+            return ISSUER_DID;
+        }
+    } catch (error) {
+        console.error('[Config] No se pudo obtener Issuer DID:', error.message);
+    }
+    
+    return null;
+}
+
+// Obtener el DID del Issuer al iniciar
+getIssuerDID();
+
+// ============================================
+// HELPER: Crear DID en Issuer Node
+// ============================================
+async function createDIDInIssuer(userData = {}) {
+    try {
+        const identityRequest = {
+            didMetadata: {
+                method: "polygonid",
+                blockchain: "polygon",
+                network: "amoy",
+                type: "BJJ"
+            }
+        };
+        
+        console.log('[CreateDID] Intentando conectar a Issuer Node...');
+        
+        const response = await axios.post(
+            `${ISSUER_NODE_URL}/v2/identities`,
+            identityRequest,
+            { 
+                headers: issuerHeaders,
+                auth: issuerAuth,
+                timeout: 5000
+            }
+        );
+
+        console.log('[CreateDID] ✅ DID creado en Issuer Node:', response.data.identifier);
+        return response.data;
+    } catch (error) {
+        console.warn('[CreateDID] ⚠️ Issuer Node no disponible, usando DID local');
+        
+        // Generar DID localmente si el Issuer Node no está disponible
+        const localDID = userData.walletAddress 
+            ? didFromEthAddress(userData.walletAddress, 'amoy')
+            : `did:polygonid:polygon:amoy:${hashData(userData.email || Date.now().toString()).slice(0, 40)}`;
+        
+        return {
+            identifier: localDID,
+            state: 'pending_issuer',
+            message: 'DID generado localmente. Issuer Node no disponible.'
+        };
+    }
+}
+
+// ============================================
+// HELPER: Crear Credencial en Issuer Node
+// ============================================
+async function createCredentialInIssuer(did, userData) {
+    try {
+        const issuerDID = await getIssuerDID();
+        
+        if (!issuerDID) {
+            throw new Error('No se pudo obtener el DID del Issuer');
+        }
+        
+        // Usar schema simple de KYCAgeCredential que es nativo del Issuer Node
+        const credentialRequest = {
+            credentialSchema: "https://raw.githubusercontent.com/iden3/claim-schema-vocab/main/schemas/json/KYCAgeCredential-v3.json",
+            type: "KYCAgeCredential",
+            credentialSubject: {
+                id: did,
+                birthday: 19960424,
+                documentType: 99
+            },
+            expiration: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60) // 1 año
+        };
+        
+        console.log('[CreateCredential] Intentando crear en Issuer Node...');
+        console.log('[CreateCredential] Issuer DID:', issuerDID);
+        console.log('[CreateCredential] Subject DID:', did);
+        
+        const response = await axios.post(
+            `${ISSUER_NODE_URL}/v2/identities/${issuerDID}/credentials`,
+            credentialRequest,
+            { 
+                headers: issuerHeaders,
+                auth: issuerAuth,
+                timeout: 5000
+            }
+        );
+
+        console.log('[CreateCredential] ✅ Credencial creada en Issuer Node:', response.data.id);
+        return response.data;
+    } catch (error) {
+        console.warn('[CreateCredential] ⚠️ Error:', error.response?.data?.message || error.message);
+        console.warn('[CreateCredential] Usando credencial local');
+        
+        // Crear credencial localmente
+        const localCredential = userData.authMethod === 'wallet'
+            ? createWalletAuthCredential(did, userData)
+            : createUserAuthCredential(did, userData);
+        
+        return {
+            ...localCredential,
+            status: 'pending_issuer',
+            message: 'Credencial generada localmente. Pendiente de sincronizar con Issuer Node.'
+        };
+    }
+}
+
+// ============================================
+// ENDPOINT: Registro
+// ============================================
 router.post('/api/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
         
-        // Validar datos recibidos
         if (!name || !email || !password) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Faltan datos requeridos: name, email, password' 
+                error: 'Faltan datos requeridos' 
             });
         }
 
-        console.log('📝 Registro de usuario:', { name, email });
+        console.log('[Register] Registrando:', email);
 
-        // PASO 1: Transformar datos según schema para el issuer node
-        const identityData = userToIdentitySchema({
-            name,
-            email,
-            state: 'active'
-        });
-
-        console.log('🔄 Creando DID en issuer node...');
-
-        // PASO 2: Crear DID en el issuer node
-        const response = await axios.post(
-            `${ISSUER_NODE_BASE_URL}/v2/identities`,
-            identityData
-        );
-
-        const did = response.data.identifier || response.data.did;
-        console.log('✅ DID creado:', did);
-
-        // PASO 3: Crear credencial verificable
-        const credential = createUserAuthCredential(did, {
-            name,
-            email,
+        const userData = {
+            fullName: name,
+            email: email,
             authMethod: 'email',
-            state: 'active',
+            accountState: 'active',
             isVerified: false
+        };
+
+        const validation = validateUserData(userData);
+        if (!validation.isValid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Datos inválidos',
+                details: validation.errors
+            });
+        }
+
+        if (!validateEmail(email)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email inválido'
+            });
+        }
+
+        const issuerResponse = await createDIDInIssuer(userData);
+        const did = issuerResponse.identifier;
+
+        const credential = await createCredentialInIssuer(did, userData);
+
+        const passwordHash = hashData(password);
+        console.log('[Register] Password hasheado');
+
+        res.json({
+            success: true,
+            did: did,
+            user: {
+                name: name,
+                email: email,
+                type: 'email',
+                state: 'active'
+            },
+            credential: credential,
+            zkpData: {
+                identifier: did,
+                state: issuerResponse.state || 'active'
+            },
+            timestamp: new Date().toISOString()
         });
-
-        console.log('📄 Credencial generada para:', email);
-
-        // PASO 4: Formatear respuesta para el frontend con datos ZKP
-        const frontendResponse = formatResponseForFrontend(response.data, {
-            name,
-            email,
-            state: 'active'
-        });
-
-        // Agregar la credencial a la respuesta
-        frontendResponse.credential = credential;
-
-        // Retornar datos al frontend incluyendo DID y datos ZKP
-        res.json(frontendResponse);
 
     } catch (error) {
-        console.error('❌ Error en registro:', error.message);
+        console.error('[Register] Error:', error.message);
         res.status(500).json({ 
             success: false,
-            error: 'Error al crear cuenta y DID', 
-            details: error.response?.data || error.message 
+            error: 'Error al crear cuenta',
+            details: error.message 
         });
     }
 });
 
-/**
- * REGISTRO/LOGIN con Wallet
- * 1. Genera DID desde wallet address
- * 2. Crea credencial de wallet
- * 3. Retorna datos ZKP
- */
+// ============================================
+// ENDPOINT: Wallet Auth
+// ============================================
 router.post('/api/wallet-auth', async (req, res) => {
     try {
-        const { walletAddress, name, signature } = req.body;
+        const { walletAddress } = req.body;
         
         if (!walletAddress) {
             return res.status(400).json({ 
@@ -105,67 +255,58 @@ router.post('/api/wallet-auth', async (req, res) => {
             });
         }
 
-        console.log('🦊 Autenticación con wallet:', walletAddress);
+        console.log('[WalletAuth] Autenticando:', walletAddress);
 
-        // PASO 1: Generar DID desde wallet address
-        // El issuer node puede generar esto o lo hacemos localmente
         const did = didFromEthAddress(walletAddress, 'testnet');
-        
-        console.log('✅ DID generado desde wallet:', did);
+        console.log('[WalletAuth] DID generado:', did);
 
-        // PASO 2: Transformar datos para issuer node
-        const identityData = walletToIdentitySchema(walletAddress, {
-            name: name || `Wallet User`,
-            state: 'active'
-        });
+        const userData = {
+            fullName: `Wallet ${walletAddress.slice(0, 6)}...`,
+            walletAddress: walletAddress,
+            authMethod: 'wallet',
+            accountState: 'active',
+            isVerified: true
+        };
 
-        // PASO 3: Registrar en issuer node (o verificar si existe)
         let issuerResponse;
         try {
-            issuerResponse = await axios.post(
-                `${ISSUER_NODE_BASE_URL}/v2/identities`,
-                identityData
-            );
+            issuerResponse = await createDIDInIssuer(userData);
         } catch (error) {
-            // Si ya existe, intentar obtenerlo
-            if (error.response?.status === 409) {
-                console.log('ℹ️  DID ya existe, procediendo con login...');
-                issuerResponse = { data: { identifier: did, state: 'active' } };
-            } else {
-                throw error;
-            }
+            issuerResponse = { identifier: did, state: 'active' };
         }
 
-        // PASO 4: Crear credencial de wallet
-        const credential = createWalletAuthCredential(did, walletAddress, {
-            name: name || `Wallet User`
+        const credential = await createCredentialInIssuer(did, userData);
+
+        res.json({
+            success: true,
+            did: did,
+            user: {
+                name: userData.fullName,
+                walletAddress: walletAddress,
+                type: 'wallet',
+                state: 'active'
+            },
+            credential: credential,
+            zkpData: {
+                identifier: did,
+                state: 'active'
+            },
+            timestamp: new Date().toISOString()
         });
-
-        // PASO 5: Formatear respuesta
-        const frontendResponse = formatResponseForFrontend(issuerResponse.data, {
-            name: name || `Wallet ${walletAddress.slice(0, 6)}...`,
-            walletAddress,
-            state: 'active'
-        });
-
-        frontendResponse.credential = credential;
-
-        res.json(frontendResponse);
 
     } catch (error) {
-        console.error('❌ Error en wallet auth:', error.message);
+        console.error('[WalletAuth] Error:', error.message);
         res.status(500).json({ 
             success: false,
-            error: 'Error en autenticación de wallet', 
-            details: error.response?.data || error.message 
+            error: 'Error en autenticación',
+            details: error.message 
         });
     }
 });
 
-/**
- * LOGIN con Email/Password
- * Verifica credenciales y obtiene DID existente
- */
+// ============================================
+// ENDPOINT: Login
+// ============================================
 router.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -177,79 +318,89 @@ router.post('/api/login', async (req, res) => {
             });
         }
 
-        console.log('🔐 Intento de login:', email);
+        console.log('[Login] Intento:', email);
 
-        // AQUÍ DEBERÍAS:
-        // 1. Verificar password en tu base de datos o sistema
-        // 2. Obtener el DID asociado al email desde el issuer node
-        // 3. Recuperar credenciales existentes
-
-        // Por ahora simulamos una respuesta exitosa
-        const mockResponse = formatLoginResponse({
-            identifier: 'did:polygonid:polygon:amoy:2qExample123',
-            state: 'active'
-        }, {
-            name: email.split('@')[0],
-            email: email,
-            authMethod: 'email'
+        const passwordHash = hashData(password);
+        
+        res.json({
+            success: true,
+            did: 'did:polygonid:polygon:amoy:2qExample',
+            user: {
+                name: email.split('@')[0],
+                email: email,
+                type: 'email',
+                state: 'active'
+            },
+            message: 'Login OK (implementar BD)'
         });
 
-        res.json(mockResponse);
-
     } catch (error) {
-        console.error('❌ Error en login:', error.message);
+        console.error('[Login] Error:', error.message);
         res.status(500).json({ 
             success: false,
-            error: 'Error al iniciar sesión', 
-            details: error.message 
+            error: 'Error al iniciar sesión'
         });
     }
 });
 
 // ============================================
-// ENDPOINTS DIRECTOS AL ISSUER NODE
+// INFO del Issuer
 // ============================================
+router.get('/api/issuer/info', async (req, res) => {
+    try {
+        const response = await axios.get(
+            `${ISSUER_NODE_URL}/v2/identities`,
+            { 
+                headers: issuerHeaders,
+                auth: issuerAuth
+            }
+        );
 
-/**
- * Endpoint directo para crear DID (passthrough)
- */
+        res.json({
+            success: true,
+            issuerUrl: ISSUER_NODE_URL,
+            identities: response.data,
+            message: 'Issuer Node conectado'
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'No se pudo conectar con Issuer Node',
+            issuerUrl: ISSUER_NODE_URL,
+            details: error.message
+        });
+    }
+});
+
+// ============================================
+// Passthrough
+// ============================================
 router.post('/v2/identities', async (req, res) => {
     try {
-        const response = await axios.post(`${ISSUER_NODE_BASE_URL}/v2/identities`, req.body);
-        res.json(response.data);
-    } catch (error) {
-        res.status(500).json({ 
-            error: 'Error al crear DID', 
-            details: error.response?.data || error.message 
-        });
-    }
-});
-
-/**
- * Endpoint con autenticación básica
- */
-router.post('/v2/identities-auth', async (req, res) => {
-    try {
-        const auth = {
-            username: 'user-issuer',
-            password: 'password-issuer'
-        };
-        const headers = {
-            'accept': 'application/json',
-            'content-type': 'application/json'
-        };
         const response = await axios.post(
-            `${ISSUER_NODE_BASE_URL}/v2/identities`,
+            `${ISSUER_NODE_URL}/v2/identities`,
             req.body,
-            { auth, headers }
+            { 
+                headers: issuerHeaders,
+                auth: issuerAuth
+            }
         );
         res.json(response.data);
     } catch (error) {
         res.status(500).json({ 
-            error: 'Error al crear DID', 
+            error: 'Error al crear DID',
             details: error.response?.data || error.message 
         });
     }
+});
+
+router.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        issuerNode: ISSUER_NODE_URL,
+        timestamp: new Date().toISOString()
+    });
 });
 
 module.exports = router;
