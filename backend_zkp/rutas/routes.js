@@ -13,6 +13,7 @@ const {
 
 const { validateUserData, createCredentialRequest } = require('../src/datasure');
 const { validateDID, validateEmail, hashData } = require('../src/validador');
+const { verifyCredentialWithIssuer } = require('../src/zkp-verifier');
 const {
     createZKPProofRequest,
     createFullProofRequest,
@@ -45,6 +46,41 @@ const issuerHeaders = {
 
 console.log('[Config] Issuer Node URL:', ISSUER_NODE_URL);
 console.log('[Config] Issuer Auth: Habilitado');
+
+// ============================================
+// ALMACENAMIENTO TEMPORAL DE USUARIOS
+// ============================================
+// En producción, esto debe ser una base de datos
+const usersStore = new Map();
+
+/**
+ * Guarda un usuario en el almacenamiento temporal
+ */
+function saveUser(email, userData) {
+    usersStore.set(email.toLowerCase(), {
+        ...userData,
+        savedAt: new Date().toISOString()
+    });
+    console.log('[Store] Usuario guardado:', email);
+}
+
+/**
+ * Obtiene un usuario del almacenamiento temporal
+ */
+function getUser(email) {
+    const user = usersStore.get(email.toLowerCase());
+    if (user) {
+        console.log('[Store] Usuario encontrado:', email);
+    }
+    return user;
+}
+
+/**
+ * Verifica si existe un usuario
+ */
+function userExists(email) {
+    return usersStore.has(email.toLowerCase());
+}
 
 // ============================================
 // HELPER: Obtener DID del Issuer
@@ -134,25 +170,37 @@ async function createCredentialInIssuer(did, userData) {
         }
         
                 // Usar schema real de IPFS
+        // Construir credentialSubject solo con campos que tienen valor
+        const credentialSubject = {
+            id: did,
+            fullName: userData.fullName || "Unknown User",
+            authMethod: userData.authMethod || "email",
+            accountState: userData.accountState || "active",
+            registrationDate: Math.floor(Date.now() / 1000),
+            isVerified: userData.isVerified || false
+        };
+
+        // Agregar email solo si existe
+        if (userData.email) {
+            credentialSubject.email = userData.email;
+        }
+
+        // Agregar walletAddress solo si existe
+        if (userData.walletAddress) {
+            credentialSubject.walletAddress = userData.walletAddress;
+        }
+
         const credentialRequest = {
             credentialSchema: "https://gateway.pinata.cloud/ipfs/QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
             type: "ZKPAuthCredential",
-            credentialSubject: {
-                id: did,
-                fullName: userData.fullName || "Unknown User",
-                email: userData.email || null,
-                walletAddress: userData.walletAddress || null,
-                authMethod: userData.authMethod || "email",
-                accountState: userData.accountState || "active",
-                registrationDate: Math.floor(Date.now() / 1000),
-                isVerified: userData.isVerified || false
-            },
+            credentialSubject: credentialSubject,
             expiration: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60) // 1 año
         };
         
         console.log('[CreateCredential] Intentando crear en Issuer Node...');
         console.log('[CreateCredential] Issuer DID:', issuerDID);
         console.log('[CreateCredential] Subject DID:', did);
+        console.log('[CreateCredential] Credential Subject:', JSON.stringify(credentialSubject, null, 2));
         
         const response = await axios.post(
             `${ISSUER_NODE_URL}/v2/identities/${issuerDID}/credentials`,
@@ -165,15 +213,43 @@ async function createCredentialInIssuer(did, userData) {
         );
 
         console.log('[CreateCredential] ✅ Credencial creada en Issuer Node:', response.data.id);
-        return response.data;
+        
+        // IMPORTANTE: Obtener la credencial COMPLETA después de crearla
+        const credentialId = response.data.id;
+        console.log('[CreateCredential] Obteniendo credencial completa...');
+        
+        try {
+            const credentialResponse = await axios.get(
+                `${ISSUER_NODE_URL}/v2/identities/${issuerDID}/credentials/${credentialId}`,
+                { 
+                    headers: issuerHeaders,
+                    auth: issuerAuth,
+                    timeout: 5000
+                }
+            );
+            
+            console.log('[CreateCredential] ✅ Credencial completa obtenida');
+            console.log('[CreateCredential] Credencial:', JSON.stringify(credentialResponse.data, null, 2));
+            
+            // IMPORTANTE: El Issuer Node devuelve { id, vc: {...} }
+            // Necesitamos devolver solo el vc (la credencial W3C)
+            return credentialResponse.data.vc || credentialResponse.data;
+        } catch (fetchError) {
+            console.warn('[CreateCredential] ⚠️ No se pudo obtener credencial completa:', fetchError.message);
+            console.warn('[CreateCredential] Devolviendo solo ID');
+            return response.data;
+        }
+        
     } catch (error) {
         console.warn('[CreateCredential] ⚠️ Error:', error.response?.data?.message || error.message);
-        console.warn('[CreateCredential] Usando credencial local');
+        console.warn('[CreateCredential] Usando credencial local como fallback');
         
         // Crear credencial localmente
         const localCredential = userData.authMethod === 'wallet'
             ? createWalletAuthCredential(did, userData.walletAddress, userData)
             : createUserAuthCredential(did, userData);
+        
+        console.log('[CreateCredential] 📄 Credencial local creada:', JSON.stringify(localCredential, null, 2));
         
         return {
             ...localCredential,
@@ -198,6 +274,14 @@ router.post('/api/register', async (req, res) => {
         }
 
         console.log('[Register] Registrando:', email);
+        
+        // Verificar si el usuario ya existe
+        if (userExists(email)) {
+            return res.status(400).json({
+                success: false,
+                error: 'El email ya está registrado. Por favor, inicia sesión.'
+            });
+        }
 
         const userData = {
             fullName: name,
@@ -230,6 +314,22 @@ router.post('/api/register', async (req, res) => {
 
         const passwordHash = hashData(password);
         console.log('[Register] Password hasheado');
+        
+        // GUARDAR USUARIO EN EL STORE
+        saveUser(email, {
+            name: name,
+            email: email,
+            password: passwordHash,
+            did: did,
+            credential: credential,
+            zkpData: {
+                identifier: did,
+                state: issuerResponse.state || 'active'
+            },
+            authMethod: 'email',
+            accountState: 'active',
+            createdAt: new Date().toISOString()
+        });
 
         res.json({
             success: true,
@@ -332,27 +432,54 @@ router.post('/api/login', async (req, res) => {
             });
         }
 
-        console.log('[Login] Intento:', email);
+        console.log('[Login] Intento de login:', email);
 
+        // Verificar si el usuario existe
+        const user = getUser(email);
+        
+        if (!user) {
+            console.log('[Login] Usuario no encontrado:', email);
+            return res.status(401).json({
+                success: false,
+                error: 'Usuario no encontrado. Por favor, regístrate primero.'
+            });
+        }
+
+        // Verificar contraseña
         const passwordHash = hashData(password);
         
+        if (user.password !== passwordHash) {
+            console.log('[Login] Contraseña incorrecta');
+            return res.status(401).json({
+                success: false,
+                error: 'Contraseña incorrecta'
+            });
+        }
+        
+        console.log('[Login] ✅ Login exitoso:', email);
+        
+        // Devolver todos los datos del usuario (DID, credencial, etc.)
         res.json({
             success: true,
-            did: 'did:polygonid:polygon:amoy:2qExample',
+            did: user.did,
             user: {
-                name: email.split('@')[0],
-                email: email,
+                name: user.name,
+                email: user.email,
                 type: 'email',
-                state: 'active'
+                state: user.accountState || 'active'
             },
-            message: 'Login OK (implementar BD)'
+            credential: user.credential,
+            zkpData: user.zkpData,
+            message: 'Login exitoso',
+            timestamp: new Date().toISOString()
         });
 
     } catch (error) {
         console.error('[Login] Error:', error.message);
         res.status(500).json({ 
             success: false,
-            error: 'Error al iniciar sesión'
+            error: 'Error al iniciar sesión',
+            details: error.message
         });
     }
 });
@@ -418,140 +545,51 @@ router.get('/health', (req, res) => {
 });
 
 // ============================================
-// ENDPOINTS ZKP - Generar y Verificar Pruebas
+// ENDPOINTS ZKP - Solo Verificación de Pruebas
 // ============================================
 
 /**
- * Generar prueba ZKP
- * POST /api/generate-proof
+ * NOTA IMPORTANTE sobre el flujo ZKP con Polygon ID:
  * 
- * Body: {
- *   "userDID": "did:polygonid:polygon:amoy:...",
- *   "issuerDID": "did:polygonid:polygon:amoy:...",
- *   "credentialId": "uuid-de-credencial",
- *   "proofType": "verification" | "accountState" | "authMethod" | "custom",
- *   "customQuery": {} // opcional para custom
- * }
+ * 1. Issuer Node: Crea DIDs y emite credenciales
+ * 2. Usuario (Wallet/Frontend): Genera proofs ZKP localmente con el SDK
+ * 3. Backend (Verificador): Solo VERIFICA los proofs, no los genera
+ * 
+ * El Issuer Node NO tiene endpoint para generar proofs.
+ * Los proofs se generan en el cliente usando @0xpolygonid/js-sdk
  */
-router.post('/generate-proof', async (req, res) => {
-    try {
-        const { userDID, issuerDID, credentialId, proofType, customQuery } = req.body;
-
-        if (!userDID || !issuerDID || !credentialId) {
-            return res.status(400).json({ 
-                error: 'Faltan campos requeridos',
-                required: ['userDID', 'issuerDID', 'credentialId']
-            });
-        }
-
-        // Crear query según el tipo de prueba
-        let query;
-        switch (proofType) {
-            case 'verification':
-                query = createVerificationQuery();
-                break;
-            case 'accountState':
-                query = createAccountStateQuery('active');
-                break;
-            case 'authMethod':
-                const method = req.body.authMethod || 'wallet';
-                query = createAuthMethodQuery(method);
-                break;
-            case 'emailRegistration':
-                query = createEmailRegistrationQuery();
-                break;
-            case 'walletRegistration':
-                query = createWalletRegistrationQuery();
-                break;
-            case 'accountAge':
-                const minDays = req.body.minDays || 30;
-                query = createAccountAgeQuery(minDays);
-                break;
-            case 'combined':
-                query = createCombinedQuery(req.body.conditions || {});
-                break;
-            case 'custom':
-                query = customQuery || {};
-                break;
-            default:
-                query = createVerificationQuery(); // Default
-        }
-
-        // Crear el proof request para el Issuer Node
-        const proofRequest = {
-            circuitId: "credentialAtomicQueryMTPV2", // MTP V2 por defecto
-            accountAddress: userDID,
-            query: {
-                allowedIssuers: [issuerDID],
-                context: "ipfs://QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
-                credentialSubject: query,
-                type: "ZKPAuthCredential"
-            }
-        };
-
-        console.log('Generando prueba ZKP:', JSON.stringify(proofRequest, null, 2));
-
-        // Llamar al Issuer Node para generar la prueba
-        // Nota: Este endpoint puede variar según la versión del Issuer Node
-        const response = await axios.post(
-            `${ISSUER_NODE_URL}/v2/proofs/query`,
-            proofRequest,
-            { 
-                headers: issuerHeaders,
-                auth: issuerAuth
-            }
-        );
-
-        console.log('Prueba ZKP generada exitosamente');
-
-        res.json({
-            success: true,
-            proof: formatZKPProofResponse(response.data),
-            proofType: proofType,
-            query: query,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('Error generando prueba ZKP:', error.response?.data || error.message);
-        res.status(500).json({ 
-            error: 'Error al generar prueba ZKP',
-            details: error.response?.data || error.message,
-            issuerNodeUrl: ISSUER_NODE_URL
-        });
-    }
-});
 
 /**
  * Verificar prueba ZKP
  * POST /verify-proof
  * 
  * Body: {
- *   "proof": { ... }, // Objeto de prueba ZKP del SDK
- *   "circuitId": "credentialAtomicQueryMTPV2",
- *   "query": { ... } // Query usado para generar la prueba
+ *   "proof": { pi_a, pi_b, pi_c },
+ *   "pub_signals": [...],
+ *   "circuitId": "credentialAtomicQueryMTPV2"
  * }
  */
 router.post('/verify-proof', async (req, res) => {
     try {
-        const { proof, circuitId, query } = req.body;
+        const { proof, pub_signals, circuitId } = req.body;
 
-        if (!proof || !circuitId) {
+        if (!proof || !pub_signals || !circuitId) {
             return res.status(400).json({ 
                 error: 'Faltan campos requeridos',
-                required: ['proof', 'circuitId']
+                required: ['proof', 'pub_signals', 'circuitId']
             });
         }
 
         console.log('🔍 Verificando prueba ZKP...');
         console.log('Circuit ID:', circuitId);
+        console.log('Pub signals:', pub_signals);
 
         // Intentar verificar con el Issuer Node
         try {
             const verificationRequest = {
                 circuitId: circuitId,
-                proof: proof.proof || proof,
-                pub_signals: proof.pub_signals || []
+                proof: proof,
+                pub_signals: pub_signals
             };
 
             const response = await axios.post(
@@ -573,24 +611,37 @@ router.post('/verify-proof', async (req, res) => {
                     ? 'Prueba ZKP verificada exitosamente' 
                     : 'Prueba ZKP inválida',
                 details: response.data,
-                query: query,
                 timestamp: new Date().toISOString()
             });
 
         } catch (issuerError) {
-            console.warn('⚠️ Issuer Node no disponible, verificación local...');
+            console.warn('⚠️ Issuer Node no disponible para verificación');
+            console.warn('Error:', issuerError.response?.data?.message || issuerError.message);
             
             // Verificación básica local si el Issuer Node falla
-            const isValid = proof && proof.proof && (proof.pub_signals || proof.publicSignals);
+            const isValid = proof && 
+                           proof.pi_a && 
+                           proof.pi_b && 
+                           proof.pi_c && 
+                           pub_signals && 
+                           pub_signals.length > 0;
+            
+            console.log('📝 Verificación local:', isValid ? 'VÁLIDA (estructura)' : 'INVÁLIDA');
             
             res.json({
                 success: true,
                 verified: isValid,
                 message: isValid 
-                    ? 'Prueba validada localmente (Issuer Node no disponible)' 
-                    : 'Prueba inválida',
+                    ? '✅ Prueba verificada localmente (estructura correcta)' 
+                    : '❌ Prueba inválida (estructura incorrecta)',
                 localVerification: true,
-                query: query,
+                note: 'Issuer Node no disponible. Verificación basada en estructura de proof.',
+                proofStructure: {
+                    hasPiA: !!proof?.pi_a,
+                    hasPiB: !!proof?.pi_b,
+                    hasPiC: !!proof?.pi_c,
+                    pubSignalsCount: pub_signals?.length || 0
+                },
                 timestamp: new Date().toISOString()
             });
         }
@@ -603,153 +654,103 @@ router.post('/verify-proof', async (req, res) => {
         });
     }
 });
-router.post('/verify-proof', async (req, res) => {
-    try {
-        const { proof, pub_signals, circuitId } = req.body;
 
-        if (!proof || !pub_signals || !circuitId) {
-            return res.status(400).json({ 
-                error: 'Faltan campos requeridos',
-                required: ['proof', 'pub_signals', 'circuitId']
+// ============================================
+// ENDPOINT: Verificar Credencial (CON VERIFICACIÓN REAL)
+// ============================================
+router.post('/api/verify-credential', async (req, res) => {
+    try {
+        const { credential, issuerDID } = req.body;
+        
+        console.log('[VerifyCredential] 🔐 Iniciando verificación ZKP...');
+        console.log('[VerifyCredential] Credential ID:', credential?.id);
+        console.log('[VerifyCredential] Issuer DID:', issuerDID);
+        
+        if (!credential || !credential.credentialSubject) {
+            return res.status(400).json({
+                success: false,
+                error: 'Credencial inválida o incompleta',
+                details: 'La credencial debe incluir credentialSubject'
             });
         }
-
-        console.log('Verificando prueba ZKP...');
-
-        // Llamar al Issuer Node para verificar la prueba
-        const verificationRequest = {
-            circuitId: circuitId,
-            proof: proof,
-            pub_signals: pub_signals
-        };
-
-        const response = await axios.post(
-            `${ISSUER_NODE_URL}/v2/proofs/verify`,
-            verificationRequest,
-            { 
-                headers: issuerHeaders,
-                auth: issuerAuth
-            }
+        
+        // Obtener el DID del Issuer (el que emitió la credencial)
+        const actualIssuerDID = credential.issuer || issuerDID || await getIssuerDID();
+        
+        console.log('[VerifyCredential] 📝 Issuer real:', actualIssuerDID);
+        
+        // VERIFICACIÓN REAL usando el Issuer Node
+        const verificationResult = await verifyCredentialWithIssuer(
+            credential,
+            actualIssuerDID,
+            ISSUER_NODE_URL,
+            issuerAuth
         );
-
-        console.log('Prueba verificada:', response.data.verified ? 'VALIDA' : 'INVALIDA');
-
-        res.json({
-            success: true,
-            verified: response.data.verified,
-            message: response.data.verified 
-                ? 'Prueba ZKP verificada exitosamente' 
-                : 'Prueba ZKP inválida',
-            details: response.data,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('[Error] verificando prueba ZKP:', error.response?.data || error.message);
-        res.status(500).json({ 
-            error: 'Error al verificar prueba ZKP',
-            details: error.response?.data || error.message
-        });
-    }
-});
-
-/**
- * Obtener esquema de prueba ZKP
- * GET /api/proof-schema?type=verification
- * 
- * Devuelve el esquema de query para diferentes tipos de pruebas
- */
-router.get('/proof-schema', (req, res) => {
-    const { type } = req.query;
-
-    const schemas = {
-        verification: {
-            description: 'Probar que el usuario está verificado sin revelar datos personales',
-            query: createVerificationQuery(),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Permitir acceso a contenido premium solo a usuarios verificados'
-        },
-        accountState: {
-            description: 'Probar que la cuenta está activa',
-            query: createAccountStateQuery('active'),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Validar que el usuario no está suspendido o baneado'
-        },
-        authMethod: {
-            description: 'Probar el método de autenticación usado (wallet o email)',
-            query: createAuthMethodQuery('wallet'),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Dar privilegios especiales a usuarios que usan wallet'
-        },
-        emailRegistration: {
-            description: 'Probar que se registró con email sin revelar el email',
-            query: createEmailRegistrationQuery(),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Validar que tiene email registrado para enviar notificaciones'
-        },
-        walletRegistration: {
-            description: 'Probar que se registró con wallet sin revelar la dirección',
-            query: createWalletRegistrationQuery(),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Validar que puede interactuar con contratos inteligentes'
-        },
-        accountAge: {
-            description: 'Probar que la cuenta tiene más de X días de antigüedad',
-            query: createAccountAgeQuery(30),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Dar descuentos a usuarios con más de 90 días registrados',
-            params: { minDays: 30 }
-        },
-        combined: {
-            description: 'Combinar múltiples condiciones en una sola prueba',
-            query: createCombinedQuery({
-                isVerified: true,
-                accountState: 'active',
-                authMethod: 'wallet',
-                minAge: 30
-            }),
-            circuitId: 'credentialAtomicQueryMTPV2',
-            example: 'Probar que está verificado, activo, usa wallet y tiene más de 30 días',
-            params: {
-                isVerified: 'boolean (opcional)',
-                accountState: 'string (opcional)',
-                authMethod: 'string (opcional)',
-                minAge: 'number (días, opcional)',
-                hasEmail: 'boolean (opcional)',
-                hasWallet: 'boolean (opcional)'
-            }
-        },
-        custom: {
-            description: 'Query personalizado con operadores ZKP',
-            query: {
-                fieldName: {
-                    $eq: 'value'
-                }
-            },
-            circuitId: 'credentialAtomicQueryMTPV2',
-            operators: {
-                $eq: 'Igual a',
-                $ne: 'No igual a',
-                $lt: 'Menor que',
-                $gt: 'Mayor que',
-                $in: 'En lista',
-                $nin: 'No en lista',
-                $exists: 'Campo existe'
-            }
+        
+        console.log('[VerifyCredential] Resultado:', verificationResult);
+        
+        if (verificationResult.verified) {
+            console.log('[VerifyCredential] ✅ CREDENCIAL VERIFICADA');
+            
+            res.json({
+                success: true,
+                verified: true,
+                message: verificationResult.warning 
+                    ? verificationResult.message 
+                    : '✅ Credencial verificada correctamente',
+                proof: {
+                    type: 'CredentialVerification',
+                    method: verificationResult.localVerification ? 'local' : 'issuer-node',
+                    timestamp: new Date().toISOString(),
+                    ...verificationResult.details
+                },
+                // Datos completos en formato JSON para mostrar
+                fullData: {
+                    verification: {
+                        verified: true,
+                        timestamp: new Date().toISOString(),
+                        method: verificationResult.localVerification ? 'local-verification' : 'issuer-node-verification',
+                        checks: {
+                            structureValid: true,
+                            issuerMatch: true,
+                            subjectMatch: true,
+                            notRevoked: verificationResult.details?.notRevoked || false,
+                            proofValid: verificationResult.details?.zkpProof ? true : false
+                        }
+                    },
+                    credential: {
+                        id: credential.id,
+                        issuer: credential.issuer,
+                        subject: credential.credentialSubject?.id,
+                        type: credential.type,
+                        issuanceDate: credential.issuanceDate,
+                        expirationDate: credential.expirationDate
+                    },
+                    zkpProof: verificationResult.details?.zkpProof || null,
+                    rawData: verificationResult.rawData || null
+                },
+                localVerification: verificationResult.localVerification || false,
+                warning: verificationResult.warning
+            });
+        } else {
+            console.log('[VerifyCredential] ❌ CREDENCIAL INVÁLIDA:', verificationResult.error);
+            
+            res.status(400).json({
+                success: false,
+                verified: false,
+                error: verificationResult.error,
+                stage: verificationResult.stage,
+                message: '❌ Credencial inválida o no verificable'
+            });
         }
-    };
-
-    if (type && schemas[type]) {
-        res.json({
-            type: type,
-            ...schemas[type],
-            availableTypes: Object.keys(schemas)
-        });
-    } else {
-        res.json({
-            message: 'Esquemas de prueba ZKP disponibles',
-            schemas: schemas,
-            usage: '/api/proof-schema?type=verification'
+        
+    } catch (error) {
+        console.error('[VerifyCredential] ❌ Error:', error.message);
+        res.status(500).json({ 
+            success: false,
+            verified: false,
+            error: 'Error al verificar credencial',
+            details: error.message
         });
     }
 });

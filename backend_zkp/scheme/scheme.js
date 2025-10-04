@@ -117,12 +117,16 @@ const createUserAuthCredential = (did, userData) => {
     const expirationTimestamp = currentTimestamp + (365 * 24 * 60 * 60); // 1 año
 
     return {
+        "id": `urn:uuid:${crypto.randomUUID()}`,
         "@context": [
             "https://www.w3.org/2018/credentials/v2",
             // "https://schema.iden3.io/core/jsonld/iden3proofs.jsonld",
             "ipfs://QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp"
         ],
         "type": ["VerifiableCredential", "ZKPAuthCredential"],
+        "issuer": did, // El mismo DID actúa como issuer en fallback local
+        "issuanceDate": new Date().toISOString(),
+        "expirationDate": new Date(expirationTimestamp * 1000).toISOString(),
         "credentialSubject": {
             id: did,
             fullName: userData.fullName || userData.name,
@@ -137,8 +141,11 @@ const createUserAuthCredential = (did, userData) => {
             "id": "https://gateway.pinata.cloud/ipfs/QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
             "type": "JsonSchema2023"
         },
-        "issuanceDate": new Date().toISOString(),
-        "expirationDate": new Date(expirationTimestamp * 1000).toISOString()
+        "credentialStatus": {
+            "id": `${did}/credentials/status`,
+            "type": "Iden3ReverseSparseMerkleTreeProof",
+            "revocationNonce": Math.floor(Math.random() * 1000000)
+        }
     };
 };
 
@@ -147,14 +154,19 @@ const createUserAuthCredential = (did, userData) => {
  */
 const createWalletAuthCredential = (did, walletAddress, userData = {}) => {
     const currentTimestamp = Math.floor(Date.now() / 1000);
+    const expirationTimestamp = currentTimestamp + (365 * 24 * 60 * 60); // 1 año
 
     return {
+        "id": `urn:uuid:${crypto.randomUUID()}`,
         "@context": [
             "https://www.w3.org/2018/credentials/v2",
             "https://schema.iden3.io/core/jsonld/iden3proofs.jsonld",
             "ipfs://QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp"
         ],
         "type": ["VerifiableCredential", "ZKPAuthCredential"],
+        "issuer": did, // El mismo DID actúa como issuer en fallback local
+        "issuanceDate": new Date().toISOString(),
+        "expirationDate": new Date(expirationTimestamp * 1000).toISOString(),
         "credentialSubject": {
             id: did,
             fullName: userData.fullName || userData.name || `Wallet ${walletAddress.slice(0, 6)}...`,
@@ -169,7 +181,11 @@ const createWalletAuthCredential = (did, walletAddress, userData = {}) => {
             "id": "https://gateway.pinata.cloud/ipfs/QmXAHpXSPcj2J7wreCkKkvvXgT67tbQDvFxmTHudXQYBEp",
             "type": "JsonSchema2023"
         },
-        "issuanceDate": new Date().toISOString()
+        "credentialStatus": {
+            "id": `${did}/credentials/status`,
+            "type": "Iden3ReverseSparseMerkleTreeProof",
+            "revocationNonce": Math.floor(Math.random() * 1000000)
+        }
     };
 };
 
