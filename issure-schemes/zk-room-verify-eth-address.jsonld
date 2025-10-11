@@ -1,0 +1,19 @@
+{
+    "@context": [
+        {
+            "@protected": true,
+            "@version": 1.1,
+            "id": "@id",
+            "type": "@type",
+            "ZkRoomTestVerifyEthAddress": {
+                "@context": {
+                    "@propagate": true,
+                    "@protected": true,
+                    "iden3-vocab": "urn:uuid:5be4612b-f4ee-482a-8d2e-165aad39e3a2#",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#"
+                },
+                "@id": "urn:uuid:c4550360-5229-4079-a40e-9aa9021637fc"
+            }
+        }
+    ]
+}
